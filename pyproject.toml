@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slurm-watchdog"
+version = "0.1.0"
+description = "A lightweight Slurm job monitor with multi-platform notifications"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Slurm Watchdog Contributors" }
+]
+keywords = ["slurm", "hpc", "monitoring", "notification", "cluster"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+dependencies = [
+    "apprise>=1.6.0",
+    "click>=8.1.0",
+    "pydantic>=2.0.0",
+    "tomli>=2.0.0;python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+slurm-watchdog = "slurm_watchdog.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/yourname/slurm-watchdog"
+Documentation = "https://github.com/yourname/slurm-watchdog#readme"
+Repository = "https://github.com/yourname/slurm-watchdog"
+Issues = "https://github.com/yourname/slurm-watchdog/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slurm_watchdog"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
