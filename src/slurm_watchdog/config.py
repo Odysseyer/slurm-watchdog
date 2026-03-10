@@ -3,7 +3,6 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from pydantic import ValidationError
 
@@ -17,14 +16,16 @@ else:
 
 DEFAULT_CONFIG_DIR = Path("~/.config/slurm-watchdog").expanduser()
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
+PROJECT_URL = "https://github.com/Odysseyer/slurm-watchdog"
 
 DEFAULT_CONFIG_TEMPLATE = """# Slurm Watchdog Configuration
-# See: https://github.com/yourname/slurm-watchdog
+# See: https://github.com/Odysseyer/slurm-watchdog
 
 [watchdog]
 # Polling interval in seconds
 poll_interval_running = 60   # When jobs are running/pending
 poll_interval_idle = 300     # When no active jobs
+disappeared_grace_seconds = 30  # Wait before treating disappeared jobs as terminal/lost
 
 # Monitor only current user's jobs (leave empty for auto-detect)
 user = ""
@@ -59,6 +60,9 @@ on_job_completed = true
 on_job_failed = true
 on_job_cancelled = true
 on_job_timeout = true
+on_job_boot_fail = true
+on_job_out_of_memory = true
+on_job_lost = true
 
 [notify.retry]
 max_retries = 3
@@ -92,6 +96,13 @@ error_patterns = [
 """
 
 
+def resolve_config_path(config_path: str | Path | None = None) -> Path:
+    """Resolve a config path, falling back to the default location."""
+    if config_path is None:
+        return DEFAULT_CONFIG_PATH
+    return Path(config_path).expanduser()
+
+
 def get_default_config_path() -> Path:
     """Get the default configuration file path."""
     return DEFAULT_CONFIG_PATH
@@ -104,19 +115,22 @@ def ensure_config_dir() -> Path:
     return config_dir
 
 
-def create_default_config() -> Path:
-    """Create the default configuration file if it doesn't exist."""
-    config_path = DEFAULT_CONFIG_PATH
+def create_default_config(config_path: str | Path | None = None) -> Path:
+    """Create a configuration file with defaults if it doesn't exist."""
+    config_path = resolve_config_path(config_path)
 
     if config_path.exists():
         return config_path
 
-    ensure_config_dir()
-    config_path.write_text(DEFAULT_CONFIG_TEMPLATE)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
     return config_path
 
 
-def load_config(config_path: Optional[Path] = None, create_if_missing: bool = True) -> Config:
+def load_config(
+    config_path: str | Path | None = None,
+    create_if_missing: bool = True,
+) -> Config:
     """Load configuration from a TOML file.
 
     Args:
@@ -130,24 +144,16 @@ def load_config(config_path: Optional[Path] = None, create_if_missing: bool = Tr
         FileNotFoundError: If config file doesn't exist and create_if_missing is False.
         ValueError: If config file is invalid.
     """
-    if config_path is None:
-        config_path = DEFAULT_CONFIG_PATH
-    else:
-        config_path = Path(config_path).expanduser()
-
-    config_path = config_path.expanduser()
+    config_path = resolve_config_path(config_path)
 
     if not config_path.exists():
         if create_if_missing:
-            create_default_config()
-            # If still doesn't exist, return default config
-            if not config_path.exists():
-                return Config()
+            create_default_config(config_path)
         else:
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     try:
-        with open(config_path, "rb") as f:
+        with config_path.open("rb") as f:
             data = tomllib.load(f)
     except Exception as e:
         raise ValueError(f"Failed to parse config file {config_path}: {e}") from e
@@ -198,6 +204,12 @@ def validate_config(config: Config) -> list[str]:
         warnings.append(
             f"poll_interval_idle ({config.watchdog.poll_interval_idle}s) is very low. "
             "Consider increasing to reduce system load when idle."
+        )
+
+    if config.watchdog.disappeared_grace_seconds < 0:
+        warnings.append(
+            "disappeared_grace_seconds is negative. "
+            "Use 0 or a positive number."
         )
 
     # Validate database path

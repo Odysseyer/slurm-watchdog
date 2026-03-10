@@ -77,7 +77,7 @@ def test_format_body(test_config, temp_db):
         max_rss="1.5G",
     )
 
-    body = notifier._format_body(job, EventType.JOB_COMPLETED)
+    body = notifier._format_body(job)
 
     assert "12345" in body
     assert "testuser" in body
@@ -100,7 +100,7 @@ def test_format_body_with_errors(test_config, temp_db):
         reason="OutOfMemory",
     )
 
-    body = notifier._format_body(job, EventType.JOB_FAILED)
+    body = notifier._format_body(job)
 
     assert "FAILED" in body
     assert "1:0" in body
@@ -114,6 +114,8 @@ def test_event_enabled(test_config, temp_db):
     assert notifier._event_enabled(EventType.JOB_COMPLETED)
     assert notifier._event_enabled(EventType.JOB_FAILED)
     assert notifier._event_enabled(EventType.JOB_STARTED)
+    assert notifier._event_enabled(EventType.JOB_OUT_OF_MEMORY)
+    assert notifier._event_enabled(EventType.JOB_BOOT_FAIL)
 
     # Not configured but defaults to True
     assert notifier._event_enabled(EventType.JOB_CANCELLED)

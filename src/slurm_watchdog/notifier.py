@@ -1,14 +1,16 @@
 """Notification system using Apprise for multi-platform support."""
 
+import logging
 import time
-from datetime import datetime
-from typing import Optional
 
 import apprise
 
+from slurm_watchdog.analyzer import OutputAnalyzer
 from slurm_watchdog.config import Config
 from slurm_watchdog.database import Database
 from slurm_watchdog.models import Event, EventType, Job, OutputAnalysis
+
+logger = logging.getLogger(__name__)
 
 
 class Notifier:
@@ -23,7 +25,7 @@ class Notifier:
         """
         self.config = config
         self.db = db
-        self._apprise: Optional[apprise.Apprise] = None
+        self._apprise: apprise.Apprise | None = None
 
     @property
     def apprise(self) -> apprise.Apprise:
@@ -49,6 +51,9 @@ class Notifier:
             EventType.JOB_FAILED: self.config.notify.on_job_failed,
             EventType.JOB_CANCELLED: self.config.notify.on_job_cancelled,
             EventType.JOB_TIMEOUT: self.config.notify.on_job_timeout,
+            EventType.JOB_BOOT_FAIL: self.config.notify.on_job_boot_fail,
+            EventType.JOB_OUT_OF_MEMORY: self.config.notify.on_job_out_of_memory,
+            EventType.JOB_LOST: self.config.notify.on_job_lost,
             EventType.JOB_PREEMPTED: True,  # Always notify preemption
             EventType.JOB_NODE_FAIL: True,  # Always notify node failures
         }
@@ -76,6 +81,9 @@ class Notifier:
             EventType.JOB_TIMEOUT: "⏱️",
             EventType.JOB_PREEMPTED: "⚠️",
             EventType.JOB_NODE_FAIL: "💥",
+            EventType.JOB_BOOT_FAIL: "🧨",
+            EventType.JOB_OUT_OF_MEMORY: "🧠",
+            EventType.JOB_LOST: "❓",
         }
         emoji = emoji_map.get(event_type, "📢")
 
@@ -84,14 +92,12 @@ class Notifier:
     def _format_body(
         self,
         job: Job,
-        event_type: EventType,
-        analysis: Optional[OutputAnalysis] = None,
+        analysis: OutputAnalysis | None = None,
     ) -> str:
         """Format notification body.
 
         Args:
             job: Job information.
-            event_type: Event type.
             analysis: Optional output analysis.
 
         Returns:
@@ -166,7 +172,7 @@ class Notifier:
         self,
         event: Event,
         job: Job,
-        analysis: Optional[OutputAnalysis] = None,
+        analysis: OutputAnalysis | None = None,
     ) -> bool:
         """Send notification for an event.
 
@@ -188,7 +194,7 @@ class Notifier:
             return True
 
         title = self._format_title(event.event_type, job)
-        body = self._format_body(job, event.event_type, analysis)
+        body = self._format_body(job, analysis)
 
         try:
             success = self.apprise.notify(
@@ -206,8 +212,24 @@ class Notifier:
         except Exception as e:
             error_msg = str(e)
             self.db.mark_event_failed(event.id, error_msg)
-            print(f"Notification failed: {error_msg}")
+            logger.warning("Notification failed: %s", error_msg)
             return False
+
+    def _analyze_job_output(self, job: Job) -> OutputAnalysis | None:
+        """Analyze terminal job output when configured and available."""
+        if not (
+            job.output_file
+            and job.state.is_terminal()
+            and self.config.output_analysis.enabled
+        ):
+            return None
+
+        analyzer = OutputAnalyzer(self.config)
+        try:
+            return analyzer.analyze(job.output_file)
+        except Exception as exc:
+            logger.warning("Failed to analyze output file for job %s: %s", job.job_id, exc)
+            return None
 
     def test_notify(self, message: str = "Test notification from Slurm Watchdog") -> bool:
         """Send a test notification.
@@ -219,7 +241,7 @@ class Notifier:
             True if successful.
         """
         if not self.config.notify.urls:
-            print("No notification URLs configured!")
+            logger.warning("No notification URLs configured")
             return False
 
         try:
@@ -228,7 +250,7 @@ class Notifier:
                 body=message,
             )
         except Exception as e:
-            print(f"Test notification failed: {e}")
+            logger.warning("Test notification failed: %s", e)
             return False
 
     def process_pending_events(self) -> tuple[int, int]:
@@ -237,8 +259,6 @@ class Notifier:
         Returns:
             Tuple of (success_count, failure_count).
         """
-        from slurm_watchdog.analyzer import OutputAnalyzer
-
         success = 0
         failed = 0
 
@@ -252,13 +272,7 @@ class Notifier:
                 continue
 
             # Analyze output file if available and job is terminal
-            analysis = None
-            if job.output_file and job.state.is_terminal() and self.config.output_analysis.enabled:
-                analyzer = OutputAnalyzer(self.config)
-                try:
-                    analysis = analyzer.analyze(job.output_file)
-                except Exception as e:
-                    print(f"Warning: Failed to analyze output file: {e}")
+            analysis = self._analyze_job_output(job)
 
             if self.notify_event(event, job, analysis):
                 success += 1
@@ -273,8 +287,6 @@ class Notifier:
         Returns:
             Tuple of (success_count, failure_count).
         """
-        from slurm_watchdog.analyzer import OutputAnalyzer
-
         success = 0
         failed = 0
         max_retries = self.config.notify.retry.max_retries
@@ -293,13 +305,7 @@ class Notifier:
                 continue
 
             # Analyze output if needed
-            analysis = None
-            if job.output_file and job.state.is_terminal() and self.config.output_analysis.enabled:
-                analyzer = OutputAnalyzer(self.config)
-                try:
-                    analysis = analyzer.analyze(job.output_file)
-                except Exception:
-                    pass
+            analysis = self._analyze_job_output(job)
 
             # Reset notified status for retry
             event.notified = 0

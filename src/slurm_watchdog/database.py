@@ -3,9 +3,27 @@
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from slurm_watchdog.models import Event, EventType, Job, JobState
+
+
+def _adapt_datetime(value: datetime) -> str:
+    """Serialize datetimes explicitly to avoid sqlite3 default adapter warnings."""
+    return value.isoformat(sep=" ")
+
+
+def _convert_timestamp(value: bytes) -> datetime:
+    """Parse SQLite timestamp values into Python datetimes."""
+    return datetime.fromisoformat(value.decode())
+
+
+sqlite3.register_adapter(datetime, _adapt_datetime)
+sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
+
+TERMINAL_STATES_SQL = (
+    "'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', "
+    "'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'OUT_OF_MEMORY'"
+)
 
 
 class Database:
@@ -21,7 +39,7 @@ class Database:
         """
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: sqlite3.Connection | None = None
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -29,7 +47,7 @@ class Database:
         if self._conn is None:
             self._conn = sqlite3.connect(
                 str(self.db_path),
-                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+                detect_types=sqlite3.PARSE_DECLTYPES,
             )
             # Enable WAL mode for better concurrency
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -165,7 +183,7 @@ class Database:
         )
         self.conn.commit()
 
-    def get_job(self, job_id: str) -> Optional[Job]:
+    def get_job(self, job_id: str) -> Job | None:
         """Get a job by ID.
 
         Args:
@@ -228,7 +246,7 @@ class Database:
             JobState.SUSPENDED,
         )
 
-    def count_jobs(self, state: Optional[JobState] = None, user: Optional[str] = None) -> int:
+    def count_jobs(self, state: JobState | None = None, user: str | None = None) -> int:
         """Count jobs matching criteria.
 
         Args:
@@ -263,10 +281,27 @@ class Database:
             Number of deleted jobs.
         """
         cursor = self.conn.cursor()
+        where_clause = f"""
+            state IN ({TERMINAL_STATES_SQL})
+            AND updated_at < datetime('now', ? || ' days')
+        """
+
+        # Delete child rows first to satisfy foreign key constraints.
         cursor.execute(
-            """
+            f"""
+            DELETE FROM events
+            WHERE job_id IN (
+                SELECT job_id FROM jobs
+                WHERE {where_clause}
+            )
+            """,
+            (f"-{days}",),
+        )
+
+        cursor.execute(
+            f"""
             DELETE FROM jobs
-            WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'OUT_OF_MEMORY')
+            WHERE state IN ({TERMINAL_STATES_SQL})
             AND updated_at < datetime('now', ? || ' days')
             """,
             (f"-{days}",),
@@ -316,7 +351,9 @@ class Database:
         try:
             cursor.execute(
                 """
-                INSERT INTO events (job_id, event_type, event_time, notified, retry_count, last_error)
+                INSERT INTO events (
+                    job_id, event_type, event_time, notified, retry_count, last_error
+                )
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (

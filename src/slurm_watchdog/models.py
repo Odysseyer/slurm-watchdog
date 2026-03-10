@@ -2,7 +2,6 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -26,6 +25,16 @@ class JobState(str, Enum):
     @classmethod
     def from_slurm_state(cls, state: str) -> "JobState":
         """Convert Slurm state string to JobState enum."""
+        if not state:
+            return cls.UNKNOWN
+
+        # Normalize variants like "CANCELLED by 1234", "FAILED+", etc.
+        normalized = state.upper().strip()
+        normalized = normalized.split()[0]
+        normalized = normalized.split("+")[0]
+        normalized = normalized.split("(")[0]
+        normalized = normalized.split(":")[0]
+
         state_map = {
             "PENDING": cls.PENDING,
             "PD": cls.PENDING,
@@ -50,7 +59,14 @@ class JobState(str, Enum):
             "OUT_OF_MEMORY": cls.OUT_OF_MEMORY,
             "OOM": cls.OUT_OF_MEMORY,
         }
-        return state_map.get(state.upper(), cls.UNKNOWN)
+        if normalized in state_map:
+            return state_map[normalized]
+
+        for key, value in state_map.items():
+            if normalized.startswith(key):
+                return value
+
+        return cls.UNKNOWN
 
     def is_terminal(self) -> bool:
         """Check if this is a terminal state (job won't change anymore)."""
@@ -81,6 +97,9 @@ class EventType(str, Enum):
     JOB_TIMEOUT = "JOB_TIMEOUT"
     JOB_PREEMPTED = "JOB_PREEMPTED"
     JOB_NODE_FAIL = "JOB_NODE_FAIL"
+    JOB_BOOT_FAIL = "JOB_BOOT_FAIL"
+    JOB_OUT_OF_MEMORY = "JOB_OUT_OF_MEMORY"
+    JOB_LOST = "JOB_LOST"
 
 
 class Job(BaseModel):
@@ -88,28 +107,28 @@ class Job(BaseModel):
 
     job_id: str
     user: str
-    name: Optional[str] = None
-    partition: Optional[str] = None
+    name: str | None = None
+    partition: str | None = None
     state: JobState
-    exit_code: Optional[str] = None  # Format: "exit_code:signal"
-    submit_time: Optional[datetime] = None
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    reason: Optional[str] = None
+    exit_code: str | None = None  # Format: "exit_code:signal"
+    submit_time: datetime | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    reason: str | None = None
     last_seen: datetime = Field(default_factory=datetime.now)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
     # Resource usage (from sacct)
-    elapsed_time: Optional[str] = None
-    max_rss: Optional[str] = None
-    max_vmsize: Optional[str] = None
-    cpu_time: Optional[str] = None
+    elapsed_time: str | None = None
+    max_rss: str | None = None
+    max_vmsize: str | None = None
+    cpu_time: str | None = None
 
     # Output file path
-    output_file: Optional[str] = None
+    output_file: str | None = None
 
-    def get_elapsed_seconds(self) -> Optional[int]:
+    def get_elapsed_seconds(self) -> int | None:
         """Parse elapsed time string to seconds."""
         if not self.elapsed_time:
             return None
@@ -130,13 +149,13 @@ class Job(BaseModel):
 class Event(BaseModel):
     """Represents a notification event."""
 
-    id: Optional[int] = None
+    id: int | None = None
     job_id: str
     event_type: EventType
     event_time: datetime = Field(default_factory=datetime.now)
     notified: int = 0  # 0=pending, 1=sent, -1=failed
     retry_count: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -145,9 +164,9 @@ class OutputAnalysis(BaseModel):
 
     converged: bool = False
     has_errors: bool = False
-    convergence_lines: list[str] = []
-    error_lines: list[str] = []
-    tail_lines: list[str] = []
+    convergence_lines: list[str] = Field(default_factory=list)
+    error_lines: list[str] = Field(default_factory=list)
+    tail_lines: list[str] = Field(default_factory=list)
 
     def get_summary(self) -> str:
         """Get a summary of the analysis."""
@@ -171,12 +190,15 @@ class RetryConfig(BaseModel):
 class NotifyConfig(BaseModel):
     """Notification configuration."""
 
-    urls: list[str] = []
+    urls: list[str] = Field(default_factory=list)
     on_job_started: bool = False
     on_job_completed: bool = True
     on_job_failed: bool = True
     on_job_cancelled: bool = True
     on_job_timeout: bool = True
+    on_job_boot_fail: bool = True
+    on_job_out_of_memory: bool = True
+    on_job_lost: bool = True
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
 
@@ -185,23 +207,27 @@ class OutputAnalysisConfig(BaseModel):
 
     enabled: bool = True
     tail_lines: int = 50
-    convergence_patterns: list[str] = [
-        "Convergence criteria met",
-        "Normal termination",
-        "SCF converged",
-        "completed successfully",
-        "CONVERGED",
-        "Finished",
-    ]
-    error_patterns: list[str] = [
-        "ERROR:",
-        "FATAL:",
-        "Segmentation fault",
-        "MPI_ERR",
-        "Killed",
-        "Abort",
-        "Exception:",
-    ]
+    convergence_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "Convergence criteria met",
+            "Normal termination",
+            "SCF converged",
+            "completed successfully",
+            "CONVERGED",
+            "Finished",
+        ]
+    )
+    error_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "ERROR:",
+            "FATAL:",
+            "Segmentation fault",
+            "MPI_ERR",
+            "Killed",
+            "Abort",
+            "Exception:",
+        ]
+    )
 
 
 class WatchdogConfig(BaseModel):
@@ -209,9 +235,10 @@ class WatchdogConfig(BaseModel):
 
     poll_interval_running: int = 60
     poll_interval_idle: int = 300
+    disappeared_grace_seconds: int = 30
     user: str = ""  # Empty means current user
-    job_name_filter: Optional[str] = None
-    partition_filter: Optional[str] = None
+    job_name_filter: str | None = None
+    partition_filter: str | None = None
 
 
 class DatabaseConfig(BaseModel):
@@ -244,5 +271,8 @@ class Config(BaseModel):
             JobState.TIMEOUT: [EventType.JOB_TIMEOUT],
             JobState.PREEMPTED: [EventType.JOB_PREEMPTED],
             JobState.NODE_FAIL: [EventType.JOB_NODE_FAIL],
+            JobState.BOOT_FAIL: [EventType.JOB_BOOT_FAIL],
+            JobState.OUT_OF_MEMORY: [EventType.JOB_OUT_OF_MEMORY],
+            JobState.UNKNOWN: [EventType.JOB_LOST],
         }
         return event_map.get(state, [])

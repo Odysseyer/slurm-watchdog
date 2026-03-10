@@ -21,7 +21,7 @@ A lightweight Slurm job monitor with multi-platform notifications for HPC cluste
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourname/slurm-watchdog.git
+git clone https://github.com/Odysseyer/slurm-watchdog.git
 cd slurm-watchdog
 
 # Install with pip
@@ -66,6 +66,7 @@ Configuration is stored in `~/.config/slurm-watchdog/config.toml`.
 [watchdog]
 poll_interval_running = 60    # Poll every 60s when jobs are active
 poll_interval_idle = 300      # Poll every 5min when idle
+disappeared_grace_seconds = 30  # Wait 30s before finalizing disappeared jobs
 user = ""                     # Empty = current user
 # job_name_filter = "^md-.*"  # Optional: filter by job name (regex)
 # partition_filter = "gpu"    # Optional: filter by partition (regex)
@@ -97,6 +98,9 @@ on_job_completed = true
 on_job_failed = true
 on_job_cancelled = true
 on_job_timeout = true
+on_job_boot_fail = true
+on_job_out_of_memory = true
+on_job_lost = true
 
 [notify.retry]
 max_retries = 3
@@ -326,7 +330,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourname/slurm-watchdog.git
+git clone https://github.com/Odysseyer/slurm-watchdog.git
 cd slurm-watchdog
 
 # 使用 pip 安装
@@ -371,6 +375,7 @@ slurm-watchdog status
 [watchdog]
 poll_interval_running = 60    # 有作业运行时每 60 秒轮询一次
 poll_interval_idle = 300      # 空闲时每 5 分钟轮询一次
+disappeared_grace_seconds = 30  # 作业从队列消失后等待 30 秒再判定
 user = ""                     # 留空表示当前用户
 # job_name_filter = "^md-.*"  # 可选：按作业名过滤（正则）
 # partition_filter = "gpu"    # 可选：按分区过滤（正则）
@@ -402,6 +407,9 @@ on_job_completed = true
 on_job_failed = true
 on_job_cancelled = true
 on_job_timeout = true
+on_job_boot_fail = true
+on_job_out_of_memory = true
+on_job_lost = true
 
 [notify.retry]
 max_retries = 3

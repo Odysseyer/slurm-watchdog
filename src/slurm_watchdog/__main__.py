@@ -3,18 +3,15 @@
 import signal
 import sys
 import time
-from pathlib import Path
 
 import click
 
 from slurm_watchdog import __version__
-from slurm_watchdog.analyzer import OutputAnalyzer
 from slurm_watchdog.config import (
-    Config,
     create_default_config,
     get_config_template,
-    get_default_config_path,
     load_config,
+    resolve_config_path,
     validate_config,
 )
 from slurm_watchdog.database import Database
@@ -35,6 +32,11 @@ from slurm_watchdog.systemd import (
     uninstall_service,
 )
 from slurm_watchdog.watcher import JobWatcher
+
+
+def _get_selected_config_path(ctx: click.Context) -> str:
+    """Resolve the config path selected on the CLI."""
+    return str(resolve_config_path(ctx.obj.get("config_path")))
 
 
 @click.group()
@@ -138,14 +140,14 @@ def logs(ctx: click.Context, follow: bool, lines: int) -> None:
 @click.pass_context
 def scan(ctx: click.Context) -> None:
     """Run a single scan of Slurm jobs."""
-    config_path = ctx.obj.get("config_path")
+    config_path = _get_selected_config_path(ctx)
     config = load_config(config_path, create_if_missing=True)
 
     with Database(config.database.path) as db:
         watcher = JobWatcher(config, db)
         updated_jobs, new_events = watcher.scan()
 
-        click.echo(f"Scanned Slurm queue")
+        click.echo("Scanned Slurm queue")
         click.echo(f"Updated {len(updated_jobs)} jobs")
         click.echo(f"Created {len(new_events)} events")
 
@@ -161,7 +163,7 @@ def scan(ctx: click.Context) -> None:
 @click.pass_context
 def run(ctx: click.Context) -> None:
     """Run the watchdog daemon (foreground)."""
-    config_path = ctx.obj.get("config_path")
+    config_path = _get_selected_config_path(ctx)
     config = load_config(config_path, create_if_missing=True)
 
     # Validate configuration
@@ -172,7 +174,11 @@ def run(ctx: click.Context) -> None:
     click.echo(f"Starting Slurm Watchdog v{__version__}")
     click.echo(f"Monitoring user: {config.watchdog.user}")
     click.echo(f"Database: {config.database.path}")
-    click.echo(f"Poll interval: {config.watchdog.poll_interval_running}s (active) / {config.watchdog.poll_interval_idle}s (idle)")
+    click.echo(
+        "Poll interval: "
+        f"{config.watchdog.poll_interval_running}s (active) / "
+        f"{config.watchdog.poll_interval_idle}s (idle)"
+    )
     click.echo(f"Notifications: {len(config.notify.urls)} endpoint(s) configured")
 
     if not config.notify.urls:
@@ -201,18 +207,27 @@ def run(ctx: click.Context) -> None:
                 updated_jobs, new_events = watcher.scan()
 
                 if updated_jobs:
-                    click.echo(f"[{time.strftime('%H:%M:%S')}] Updated {len(updated_jobs)} jobs, {len(new_events)} events")
+                    click.echo(
+                        f"[{time.strftime('%H:%M:%S')}] "
+                        f"Updated {len(updated_jobs)} jobs, {len(new_events)} events"
+                    )
 
                 # Process pending notifications
                 if notifier.has_urls_configured():
                     success, failed = notifier.process_pending_events()
                     if success or failed:
-                        click.echo(f"[{time.strftime('%H:%M:%S')}] Notifications: {success} sent, {failed} failed")
+                        click.echo(
+                            f"[{time.strftime('%H:%M:%S')}] "
+                            f"Notifications: {success} sent, {failed} failed"
+                        )
 
                     # Retry failed notifications
                     retry_success, retry_failed = notifier.retry_failed_events()
                     if retry_success or retry_failed:
-                        click.echo(f"[{time.strftime('%H:%M:%S')}] Retries: {retry_success} sent, {retry_failed} failed")
+                        click.echo(
+                            f"[{time.strftime('%H:%M:%S')}] "
+                            f"Retries: {retry_success} sent, {retry_failed} failed"
+                        )
 
                 # Get adaptive poll interval
                 interval = watcher.get_poll_interval()
@@ -235,12 +250,12 @@ def run(ctx: click.Context) -> None:
 @click.pass_context
 def test_notify(ctx: click.Context, message: str) -> None:
     """Send a test notification."""
-    config_path = ctx.obj.get("config_path")
+    config_path = _get_selected_config_path(ctx)
     config = load_config(config_path, create_if_missing=True)
 
     if not config.notify.urls:
         click.echo("No notification URLs configured!")
-        click.echo(f"Edit {get_default_config_path()} to add notification services.")
+        click.echo(f"Edit {config_path} to add notification services.")
         sys.exit(1)
 
     click.echo(f"Sending test notification to {len(config.notify.urls)} endpoint(s)...")
@@ -267,14 +282,15 @@ def config_cmd() -> None:
 @click.pass_context
 def config_show(ctx: click.Context) -> None:
     """Show current configuration."""
-    config_path = ctx.obj.get("config_path")
+    config_path = _get_selected_config_path(ctx)
     config = load_config(config_path, create_if_missing=True)
 
-    click.echo(f"Configuration file: {get_default_config_path()}")
+    click.echo(f"Configuration file: {config_path}")
     click.echo()
-    click.echo(f"[watchdog]")
+    click.echo("[watchdog]")
     click.echo(f"  poll_interval_running = {config.watchdog.poll_interval_running}")
     click.echo(f"  poll_interval_idle = {config.watchdog.poll_interval_idle}")
+    click.echo(f"  disappeared_grace_seconds = {config.watchdog.disappeared_grace_seconds}")
     click.echo(f"  user = {config.watchdog.user}")
     if config.watchdog.job_name_filter:
         click.echo(f"  job_name_filter = {config.watchdog.job_name_filter}")
@@ -282,20 +298,23 @@ def config_show(ctx: click.Context) -> None:
         click.echo(f"  partition_filter = {config.watchdog.partition_filter}")
 
     click.echo()
-    click.echo(f"[database]")
+    click.echo("[database]")
     click.echo(f"  path = {config.database.path}")
 
     click.echo()
-    click.echo(f"[notify]")
+    click.echo("[notify]")
     click.echo(f"  urls = {len(config.notify.urls)} configured")
     click.echo(f"  on_job_started = {config.notify.on_job_started}")
     click.echo(f"  on_job_completed = {config.notify.on_job_completed}")
     click.echo(f"  on_job_failed = {config.notify.on_job_failed}")
     click.echo(f"  on_job_cancelled = {config.notify.on_job_cancelled}")
     click.echo(f"  on_job_timeout = {config.notify.on_job_timeout}")
+    click.echo(f"  on_job_boot_fail = {config.notify.on_job_boot_fail}")
+    click.echo(f"  on_job_out_of_memory = {config.notify.on_job_out_of_memory}")
+    click.echo(f"  on_job_lost = {config.notify.on_job_lost}")
 
     click.echo()
-    click.echo(f"[output_analysis]")
+    click.echo("[output_analysis]")
     click.echo(f"  enabled = {config.output_analysis.enabled}")
     click.echo(f"  tail_lines = {config.output_analysis.tail_lines}")
 
@@ -304,7 +323,7 @@ def config_show(ctx: click.Context) -> None:
 @click.pass_context
 def config_init(ctx: click.Context) -> None:
     """Initialize configuration file with defaults."""
-    config_path = create_default_config()
+    config_path = create_default_config(_get_selected_config_path(ctx))
     click.echo(f"Created configuration file: {config_path}")
     click.echo("Edit this file to configure notification URLs and other settings.")
 
@@ -320,12 +339,12 @@ def config_template(ctx: click.Context) -> None:
 @click.pass_context
 def config_validate(ctx: click.Context) -> None:
     """Validate current configuration."""
-    config_path = ctx.obj.get("config_path")
+    config_path = _get_selected_config_path(ctx)
 
     try:
         config = load_config(config_path, create_if_missing=False)
     except FileNotFoundError:
-        click.echo(f"Configuration file not found: {get_default_config_path()}")
+        click.echo(f"Configuration file not found: {config_path}")
         click.echo("Run 'slurm-watchdog config init' to create it.")
         sys.exit(1)
     except ValueError as e:

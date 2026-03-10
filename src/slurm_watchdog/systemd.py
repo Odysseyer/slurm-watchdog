@@ -1,9 +1,9 @@
 """Systemd user service management for Slurm Watchdog."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 # Default paths
 SERVICE_NAME = "slurm-watchdog"
@@ -13,7 +13,7 @@ SERVICE_FILE = SERVICE_DIR / f"{SERVICE_NAME}.service"
 
 SYSTEMD_SERVICE_TEMPLATE = """[Unit]
 Description=Slurm Job Watchdog
-Documentation=https://github.com/yourname/slurm-watchdog
+Documentation=https://github.com/Odysseyer/slurm-watchdog
 After=network-online.target
 Wants=network-online.target
 
@@ -53,14 +53,9 @@ def get_service_file() -> Path:
 
 def get_executable_path() -> str:
     """Get the path to the slurm-watchdog executable."""
-    # Try to find the executable in PATH
-    result = subprocess.run(
-        ["which", "slurm-watchdog"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
+    executable = shutil.which("slurm-watchdog")
+    if executable:
+        return executable
 
     # Fall back to ~/.local/bin
     home = Path.home()

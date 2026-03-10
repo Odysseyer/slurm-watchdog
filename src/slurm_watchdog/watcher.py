@@ -1,13 +1,16 @@
 """Slurm job monitoring core logic."""
 
+import logging
 import re
 import subprocess
 from datetime import datetime
-from typing import Optional
+from os import environ
 
 from slurm_watchdog.config import Config
 from slurm_watchdog.database import Database
 from slurm_watchdog.models import Event, EventType, Job, JobState
+
+logger = logging.getLogger(__name__)
 
 
 class SlurmError(Exception):
@@ -20,25 +23,82 @@ class SlurmParser:
     """Parse Slurm command outputs."""
 
     @staticmethod
-    def parse_squeue(output: str) -> list[dict]:
-        """Parse squeue output in format=value mode.
+    def _parse_delimited_line(line: str, field_names: list[str]) -> dict:
+        """Parse a delimited row into field/value dict."""
+        values = line.split("|")
+        if len(values) < len(field_names):
+            values.extend([""] * (len(field_names) - len(values)))
+
+        return {
+            field: (value if value else None)
+            for field, value in zip(field_names, values, strict=False)
+        }
+
+    @staticmethod
+    def _parse_key_value_line(line: str, delimiter: str = "|") -> dict:
+        """Parse key=value style output line."""
+        job_data = {}
+        for part in line.split(delimiter):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                job_data[key] = value if value else None
+        return job_data
+
+    @staticmethod
+    def parse_squeue(output: str, field_names: list[str] | None = None) -> list[dict]:
+        """Parse squeue output.
 
         Args:
             output: Raw squeue output.
+            field_names: Field order for delimited output.
 
         Returns:
             List of job dictionaries.
         """
         jobs = []
         for line in output.strip().split("\n"):
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
 
-            # Parse format like: JobId=12345|UserId=user(1000)|...
+            if "=" in line and "|" in line:
+                job_data = SlurmParser._parse_key_value_line(line)
+            elif field_names:
+                job_data = SlurmParser._parse_delimited_line(line, field_names)
+            else:
+                continue
+
+            if job_data.get("JobId"):
+                jobs.append(job_data)
+
+        return jobs
+
+    @staticmethod
+    def parse_sacct(output: str, field_names: list[str]) -> list[dict]:
+        """Parse sacct output.
+
+        Args:
+            output: Raw sacct output.
+            field_names: Field order for delimited output.
+
+        Returns:
+            List of job dictionaries.
+        """
+        return SlurmParser.parse_squeue(output, field_names)
+
+    @staticmethod
+    def parse_scontrol(output: str) -> list[dict]:
+        """Parse one-line scontrol output (space-delimited key=value pairs)."""
+        jobs = []
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
             job_data = {}
-            for part in line.split("|"):
-                if "=" in part:
-                    key, value = part.split("=", 1)
+            for token in line.split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
                     job_data[key] = value if value else None
 
             if job_data.get("JobId"):
@@ -47,19 +107,7 @@ class SlurmParser:
         return jobs
 
     @staticmethod
-    def parse_sacct(output: str) -> list[dict]:
-        """Parse sacct output in format=value mode.
-
-        Args:
-            output: Raw sacct output.
-
-        Returns:
-            List of job dictionaries.
-        """
-        return SlurmParser.parse_squeue(output)  # Same format
-
-    @staticmethod
-    def parse_time(time_str: Optional[str]) -> Optional[datetime]:
+    def parse_time(time_str: str | None) -> datetime | None:
         """Parse Slurm timestamp to datetime.
 
         Args:
@@ -68,7 +116,7 @@ class SlurmParser:
         Returns:
             datetime or None.
         """
-        if not time_str or time_str in ("Unknown", "N/A", ""):
+        if not time_str or time_str in ("Unknown", "N/A", "", "None", "(null)"):
             return None
 
         # Try common formats
@@ -101,7 +149,18 @@ class SlurmClient:
         "SubmitTime",
         "StartTime",
         "Reason",
-        "ExitCode",
+    ]
+
+    # squeue format placeholders corresponding to SQUEUE_FIELDS above.
+    SQUEUE_FORMAT = [
+        "%i",  # JobId
+        "%u",  # UserId
+        "%j",  # Name
+        "%P",  # Partition
+        "%T",  # State
+        "%V",  # SubmitTime
+        "%S",  # StartTime
+        "%r",  # Reason
     ]
 
     # Fields to request from sacct
@@ -148,14 +207,24 @@ class SlurmClient:
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
                 timeout=30,
             )
+            stderr = (result.stderr or "").strip()
+            if result.returncode != 0:
+                raise SlurmError(
+                    f"Command failed ({result.returncode}): {' '.join(cmd)}\n{stderr}"
+                )
+
+            # Some Slurm commands may return code 0 but still report hard errors to stderr.
+            if stderr and re.search(r"(error|failed|fatal)", stderr, re.IGNORECASE):
+                raise SlurmError(
+                    f"Command reported error: {' '.join(cmd)}\n{stderr}"
+                )
+
             return result.stdout
         except subprocess.TimeoutExpired as e:
             raise SlurmError(f"Command timed out: {' '.join(cmd)}") from e
-        except subprocess.CalledProcessError as e:
-            raise SlurmError(f"Command failed: {e.stderr}") from e
         except FileNotFoundError as e:
             raise SlurmError(f"Command not found: {cmd[0]}") from e
 
@@ -165,52 +234,24 @@ class SlurmClient:
         Returns:
             List of job dictionaries.
         """
-        user = self.config.watchdog.user or None
-        user_filter = f"--user={user}" if user else "--user=$USER"
-
-        format_str = "|".join(self.SQUEUE_FIELDS)
+        user = (
+            self.config.watchdog.user
+            or environ.get("USER")
+            or environ.get("LOGNAME")
+        )
+        format_str = "|".join(self.SQUEUE_FORMAT)
         cmd = [
             "squeue",
-            user_filter,
             "--noheader",
-            "--format=%" + format_str,
-        ]
-
-        output = self._run_command(cmd)
-        return SlurmParser.parse_squeue(output)
-
-    def get_completed_job(self, job_id: str) -> Optional[dict]:
-        """Get a completed job's details from sacct.
-
-        Args:
-            job_id: Job ID to look up.
-
-        Returns:
-            Job dictionary or None.
-        """
-        format_str = "|".join(self.SACCT_FIELDS)
-        cmd = [
-            "sacct",
-            "--jobs",
-            job_id,
             "--format=" + format_str,
-            "--noheader",
-            "--parsable2",
-            "--starttime",
-            "now-7days",  # Limit search range
         ]
+        if user:
+            cmd.extend(["--user", user])
 
         output = self._run_command(cmd)
-        jobs = SlurmParser.parse_sacct(output)
+        return SlurmParser.parse_squeue(output, self.SQUEUE_FIELDS)
 
-        # Return the main job (not batch steps)
-        for job in jobs:
-            if "." not in str(job.get("JobId", "")):
-                return job
-
-        return jobs[0] if jobs else None
-
-    def get_user_jobs_from_sacct(self, job_ids: list[str]) -> list[dict]:
+    def get_jobs_from_sacct(self, job_ids: list[str]) -> list[dict]:
         """Get multiple jobs from sacct.
 
         Args:
@@ -222,7 +263,7 @@ class SlurmClient:
         if not job_ids:
             return []
 
-        format_str = "|".join(self.SACCT_FIELDS)
+        format_str = ",".join(self.SACCT_FIELDS)
         cmd = [
             "sacct",
             "--jobs",
@@ -235,10 +276,20 @@ class SlurmClient:
         ]
 
         output = self._run_command(cmd)
-        jobs = SlurmParser.parse_sacct(output)
+        jobs = SlurmParser.parse_sacct(output, self.SACCT_FIELDS)
 
         # Filter to main jobs only (not batch steps)
         return [j for j in jobs if "." not in str(j.get("JobId", ""))]
+
+    def get_job_from_scontrol(self, job_id: str) -> dict | None:
+        """Get job details via scontrol, useful when slurmdbd/sacct is unavailable."""
+        cmd = ["scontrol", "show", "job", job_id, "-o"]
+        output = self._run_command(cmd)
+        jobs = SlurmParser.parse_scontrol(output)
+        for job in jobs:
+            if str(job.get("JobId")) == str(job_id):
+                return job
+        return jobs[0] if jobs else None
 
 
 class JobWatcher:
@@ -254,6 +305,9 @@ class JobWatcher:
         self.config = config
         self.db = db
         self.client = SlurmClient(config)
+        self.disappeared_grace_seconds = max(
+            0, self.config.watchdog.disappeared_grace_seconds
+        )
 
     def _job_matches_filters(self, job_data: dict) -> bool:
         """Check if a job matches configured filters.
@@ -267,14 +321,14 @@ class JobWatcher:
         # Check name filter
         name_filter = self.config.watchdog.job_name_filter
         if name_filter:
-            job_name = job_data.get("Name", job_data.get("JobName", ""))
+            job_name = job_data.get("Name", job_data.get("JobName", "")) or ""
             if not re.search(name_filter, job_name):
                 return False
 
         # Check partition filter
         partition_filter = self.config.watchdog.partition_filter
         if partition_filter:
-            partition = job_data.get("Partition", "")
+            partition = job_data.get("Partition", "") or ""
             if not re.search(partition_filter, partition):
                 return False
 
@@ -303,6 +357,28 @@ class JobWatcher:
             submit_time=SlurmParser.parse_time(job_data.get("SubmitTime")),
             start_time=SlurmParser.parse_time(job_data.get("StartTime")),
             reason=job_data.get("Reason"),
+            last_seen=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+    def _scontrol_to_job(self, job_data: dict) -> Job:
+        """Convert scontrol output to Job model."""
+        user_id = job_data.get("UserId", "")
+        user = user_id.split("(")[0] if user_id else self.config.watchdog.user
+
+        return Job(
+            job_id=str(job_data.get("JobId")),
+            user=user,
+            name=job_data.get("JobName"),
+            partition=job_data.get("Partition"),
+            state=JobState.from_slurm_state(job_data.get("JobState", "UNKNOWN")),
+            exit_code=job_data.get("ExitCode"),
+            submit_time=SlurmParser.parse_time(job_data.get("SubmitTime")),
+            start_time=SlurmParser.parse_time(job_data.get("StartTime")),
+            end_time=SlurmParser.parse_time(job_data.get("EndTime")),
+            reason=job_data.get("Reason"),
+            elapsed_time=job_data.get("RunTime"),
+            output_file=job_data.get("StdOut"),
             last_seen=datetime.now(),
             updated_at=datetime.now(),
         )
@@ -351,7 +427,7 @@ class JobWatcher:
             queue_jobs = self.client.get_queue_jobs()
         except SlurmError as e:
             # Log error but don't crash
-            print(f"Warning: Failed to query squeue: {e}")
+            logger.warning("Failed to query squeue: %s", e)
             return [], []
 
         queue_job_ids = set()
@@ -395,47 +471,62 @@ class JobWatcher:
         tracked_jobs = self.db.get_all_active_jobs()
         disappeared_jobs = [j for j in tracked_jobs if j.job_id not in queue_job_ids]
 
-        # 4. Query sacct for disappeared jobs
+        # 4. Query details for disappeared jobs after grace period
         if disappeared_jobs:
-            disappeared_ids = [j.job_id for j in disappeared_jobs]
+            eligible_jobs = []
+            for job in disappeared_jobs:
+                age_seconds = (now - job.last_seen).total_seconds()
+                if age_seconds >= self.disappeared_grace_seconds:
+                    eligible_jobs.append(job)
 
-            try:
-                completed_jobs_data = self.client.get_user_jobs_from_sacct(disappeared_ids)
-                completed_map = {str(j.get("JobId")): j for j in completed_jobs_data}
-            except SlurmError as e:
-                print(f"Warning: Failed to query sacct: {e}")
-                completed_map = {}
+            if eligible_jobs:
+                disappeared_ids = [j.job_id for j in eligible_jobs]
 
-            for old_job in disappeared_jobs:
-                job_id = old_job.job_id
+                try:
+                    completed_jobs_data = self.client.get_jobs_from_sacct(disappeared_ids)
+                    completed_map = {str(j.get("JobId")): j for j in completed_jobs_data}
+                except SlurmError as e:
+                    logger.warning("Failed to query sacct, fallback to scontrol: %s", e)
+                    completed_map = {}
 
-                if job_id in completed_map:
-                    # Update with sacct data
-                    job = self._sacct_to_job(completed_map[job_id])
+                for old_job in eligible_jobs:
+                    job_id = old_job.job_id
+                    job = None
+
+                    if job_id in completed_map:
+                        # Preferred source: sacct (has richer terminal metrics).
+                        job = self._sacct_to_job(completed_map[job_id])
+                    else:
+                        try:
+                            scontrol_data = self.client.get_job_from_scontrol(job_id)
+                        except SlurmError:
+                            scontrol_data = None
+
+                        if scontrol_data:
+                            job = self._scontrol_to_job(scontrol_data)
+                        else:
+                            # Could not resolve terminal status from any source.
+                            job = old_job.model_copy(update={
+                                "state": JobState.UNKNOWN,
+                                "last_seen": now,
+                                "updated_at": now,
+                            })
+
                     job.created_at = old_job.created_at
                     self.db.upsert_job(job)
-                else:
-                    # Mark as unknown/lost
-                    job = old_job.model_copy(update={
-                        "state": JobState.UNKNOWN,
-                        "last_seen": now,
-                        "updated_at": now,
-                    })
-                    self.db.upsert_job(job)
 
-                # Create terminal state events
-                events = self._create_state_change_events(job, old_job.state)
-                new_events.extend(events)
-                updated_jobs.append(job)
+                    # Create events for state transitions when mapped.
+                    events = self._create_state_change_events(job)
+                    new_events.extend(events)
+                    updated_jobs.append(job)
 
         return updated_jobs, new_events
 
-    def _create_state_change_events(self, job: Job, old_state: JobState) -> list[Event]:
+    def _create_state_change_events(self, job: Job) -> list[Event]:
         """Create events for state changes.
 
         Args:
             job: Job with new state.
-            old_state: Previous state.
 
         Returns:
             List of new events.
@@ -452,6 +543,9 @@ class JobWatcher:
             JobState.TIMEOUT: EventType.JOB_TIMEOUT,
             JobState.PREEMPTED: EventType.JOB_PREEMPTED,
             JobState.NODE_FAIL: EventType.JOB_NODE_FAIL,
+            JobState.BOOT_FAIL: EventType.JOB_BOOT_FAIL,
+            JobState.OUT_OF_MEMORY: EventType.JOB_OUT_OF_MEMORY,
+            JobState.UNKNOWN: EventType.JOB_LOST,
         }
 
         event_type = state_events.get(job.state)

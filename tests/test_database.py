@@ -1,6 +1,7 @@
 """Tests for the database module."""
 
 import tempfile
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -222,3 +223,35 @@ def test_delete_old_jobs(temp_db):
     assert deleted == 1
 
     assert temp_db.get_job("1") is None
+
+
+def test_datetime_round_trip_has_no_deprecation_warnings(temp_db):
+    """Database datetime handling should not rely on deprecated sqlite defaults."""
+    submit_time = datetime(2024, 1, 1, 10, 0, 0)
+    event_time = datetime(2024, 1, 1, 11, 0, 0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+
+        job = Job(
+            job_id="123",
+            user="u",
+            state=JobState.COMPLETED,
+            submit_time=submit_time,
+        )
+        temp_db.upsert_job(job)
+        retrieved_job = temp_db.get_job("123")
+
+        event_id = temp_db.create_event(
+            Event(
+                job_id="123",
+                event_type=EventType.JOB_COMPLETED,
+                event_time=event_time,
+            )
+        )
+        pending_event = temp_db.get_job_events("123")[0]
+
+    assert event_id > 0
+    assert retrieved_job is not None
+    assert retrieved_job.submit_time == submit_time
+    assert pending_event.event_time == event_time

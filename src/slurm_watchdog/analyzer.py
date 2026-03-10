@@ -1,9 +1,7 @@
 """Output file analysis for Slurm job outputs."""
 
 import os
-import re
 from pathlib import Path
-from typing import Optional
 
 from slurm_watchdog.config import Config
 from slurm_watchdog.models import OutputAnalysis
@@ -40,7 +38,7 @@ class OutputAnalyzer:
             )
 
         try:
-            with open(path, "r", errors="replace") as f:
+            with path.open(errors="replace") as f:
                 # Read last N lines
                 lines = self._tail_file(f, self.analysis_config.tail_lines)
         except Exception as e:
@@ -196,7 +194,7 @@ class OutputAnalyzer:
         return "\n".join(lines)
 
 
-def find_output_file(job_id: str, working_dir: Optional[str] = None) -> Optional[str]:
+def find_output_file(job_id: str, working_dir: str | None = None) -> str | None:
     """Try to find the output file for a job.
 
     Slurm output files are typically named:

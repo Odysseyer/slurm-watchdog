@@ -44,10 +44,10 @@ dev = [
 slurm-watchdog = "slurm_watchdog.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/yourname/slurm-watchdog"
-Documentation = "https://github.com/yourname/slurm-watchdog#readme"
-Repository = "https://github.com/yourname/slurm-watchdog"
-Issues = "https://github.com/yourname/slurm-watchdog/issues"
+Homepage = "https://github.com/Odysseyer/slurm-watchdog"
+Documentation = "https://github.com/Odysseyer/slurm-watchdog#readme"
+Repository = "https://github.com/Odysseyer/slurm-watchdog"
+Issues = "https://github.com/Odysseyer/slurm-watchdog/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/slurm_watchdog"]
