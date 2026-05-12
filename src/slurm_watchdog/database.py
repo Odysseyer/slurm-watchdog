@@ -78,6 +78,7 @@ class Database:
                 max_vmsize TEXT,
                 cpu_time TEXT,
                 output_file TEXT,
+                work_dir TEXT,
                 last_seen TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -141,8 +142,8 @@ class Database:
                 job_id, user, name, partition, state, exit_code,
                 submit_time, start_time, end_time, reason,
                 elapsed_time, max_rss, max_vmsize, cpu_time, output_file,
-                last_seen, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                work_dir, last_seen, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 user = excluded.user,
                 name = excluded.name,
@@ -158,6 +159,7 @@ class Database:
                 max_vmsize = excluded.max_vmsize,
                 cpu_time = excluded.cpu_time,
                 output_file = excluded.output_file,
+                work_dir = excluded.work_dir,
                 last_seen = excluded.last_seen,
                 updated_at = excluded.updated_at
             """,
@@ -177,6 +179,7 @@ class Database:
                 job.max_vmsize,
                 job.cpu_time,
                 job.output_file,
+                job.work_dir,
                 job.last_seen,
                 job.updated_at,
             ),
@@ -195,11 +198,11 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT job_id, user, name, partition, state, exit_code,
-                   submit_time, start_time, end_time, reason,
-                   elapsed_time, max_rss, max_vmsize, cpu_time, output_file,
-                   last_seen, created_at, updated_at
-            FROM jobs WHERE job_id = ?
+                    SELECT job_id, user, name, partition, state, exit_code,
+                           submit_time, start_time, end_time, reason,
+                           elapsed_time, max_rss, max_vmsize, cpu_time, output_file,
+                           work_dir, last_seen, created_at, updated_at
+                    FROM jobs WHERE job_id = ?
             """,
             (job_id,),
         )
@@ -227,7 +230,7 @@ class Database:
             SELECT job_id, user, name, partition, state, exit_code,
                    submit_time, start_time, end_time, reason,
                    elapsed_time, max_rss, max_vmsize, cpu_time, output_file,
-                   last_seen, created_at, updated_at
+                   work_dir, last_seen, created_at, updated_at
             FROM jobs WHERE state IN ({placeholders})
             """,
             [s.value for s in states],
@@ -328,9 +331,10 @@ class Database:
             max_vmsize=row[12],
             cpu_time=row[13],
             output_file=row[14],
-            last_seen=row[15],
-            created_at=row[16],
-            updated_at=row[17],
+            work_dir=row[15],
+            last_seen=row[16],
+            created_at=row[17],
+            updated_at=row[18],
         )
 
     # Event operations

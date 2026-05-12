@@ -1,20 +1,22 @@
 """Notification system using Apprise for multi-platform support."""
 
+import asyncio
 import logging
 import time
+from typing import Any
 
 import apprise
 
 from slurm_watchdog.analyzer import OutputAnalyzer
 from slurm_watchdog.config import Config
 from slurm_watchdog.database import Database
-from slurm_watchdog.models import Event, EventType, Job, OutputAnalysis
+from slurm_watchdog.models import Event, EventType, Job, JobState, OutputAnalysis
 
 logger = logging.getLogger(__name__)
 
 
 class Notifier:
-    """Handles multi-platform notifications via Apprise."""
+    """Handles multi-platform notifications via Apprise and QQ Bot."""
 
     def __init__(self, config: Config, db: Database):
         """Initialize notifier.
@@ -26,6 +28,7 @@ class Notifier:
         self.config = config
         self.db = db
         self._apprise: apprise.Apprise | None = None
+        self._qqbot_client: Any = None  # QQBotClient, lazy loaded
 
     @property
     def apprise(self) -> apprise.Apprise:
@@ -35,6 +38,117 @@ class Notifier:
             for url in self.config.notify.urls:
                 self._apprise.add(url)
         return self._apprise
+
+    @property
+    def qqbot_client(self) -> Any:
+        """Get QQ Bot client instance (lazy loaded)."""
+        if self._qqbot_client is None and self.config.qqbot.enabled:
+            from slurm_watchdog.qqbot import QQBotClient
+
+            if self.config.qqbot.app_id and self.config.qqbot.client_secret:
+                self._qqbot_client = QQBotClient(
+                    app_id=self.config.qqbot.app_id,
+                    client_secret=self.config.qqbot.client_secret,
+                )
+        return self._qqbot_client
+
+    def has_qqbot_configured(self) -> bool:
+        """Check if QQ Bot is configured and enabled.
+
+        Returns:
+            True if QQ Bot is enabled with valid credentials.
+        """
+        qqbot = self.config.qqbot
+        return (
+            qqbot.enabled
+            and bool(qqbot.app_id)
+            and bool(qqbot.client_secret)
+            and (bool(qqbot.notify_groups) or bool(qqbot.notify_users))
+        )
+
+    async def notify_event_qqbot(
+        self,
+        job: Job,
+        event_type: EventType,
+        analysis: OutputAnalysis | None = None,
+    ) -> bool:
+        """Send notification via QQ Bot.
+
+        Args:
+            job: Job information.
+            event_type: Event type.
+            analysis: Optional output analysis.
+
+        Returns:
+            True if notification was sent successfully.
+        """
+        if not self.has_qqbot_configured():
+            return True  # Not configured, skip silently
+
+        client = self.qqbot_client
+        if client is None:
+            return True
+
+        from slurm_watchdog.qqbot import format_job_notification, QQBotError
+
+        message = format_job_notification(job, event_type, analysis)
+        success = True
+
+        # Send to groups
+        for group_openid in self.config.qqbot.notify_groups:
+            try:
+                await client.send_group_message(group_openid, message)
+                logger.debug("QQ Bot notification sent to group %s", group_openid)
+            except QQBotError as e:
+                logger.warning("Failed to send QQ Bot message to group %s: %s", group_openid, e)
+                success = False
+
+        # Send to users
+        for user_openid in self.config.qqbot.notify_users:
+            try:
+                await client.send_private_message(user_openid, message)
+                logger.debug("QQ Bot notification sent to user %s", user_openid)
+            except QQBotError as e:
+                logger.warning("Failed to send QQ Bot message to user %s: %s", user_openid, e)
+                success = False
+
+        return success
+
+    def notify_event_qqbot_sync(
+        self,
+        job: Job,
+        event_type: EventType,
+        analysis: OutputAnalysis | None = None,
+    ) -> bool:
+        """Synchronous wrapper for QQ Bot notification.
+
+        Args:
+            job: Job information.
+            event_type: Event type.
+            analysis: Optional output analysis.
+
+        Returns:
+            True if notification was sent successfully.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a new event loop if current one is running
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.notify_event_qqbot(job, event_type, analysis),
+                    )
+                    return future.result(timeout=30)
+            else:
+                return loop.run_until_complete(
+                    self.notify_event_qqbot(job, event_type, analysis)
+                )
+        except Exception as e:
+            logger.warning("Failed to send QQ Bot notification: %s", e)
+            return False
 
     def _event_enabled(self, event_type: EventType) -> bool:
         """Check if notification is enabled for an event type.
@@ -196,23 +310,39 @@ class Notifier:
         title = self._format_title(event.event_type, job)
         body = self._format_body(job, analysis)
 
-        try:
-            success = self.apprise.notify(
-                title=title,
-                body=body,
-            )
+        # Track success across all notification channels
+        all_success = True
+        errors = []
 
-            if success:
-                self.db.mark_event_sent(event.id)
-                return True
-            else:
-                self.db.mark_event_failed(event.id, "Apprise returned False")
-                return False
+        # Send via Apprise (if configured)
+        if self.config.notify.urls:
+            try:
+                success = self.apprise.notify(
+                    title=title,
+                    body=body,
+                )
+                if not success:
+                    all_success = False
+                    errors.append("Apprise returned False")
+            except Exception as e:
+                all_success = False
+                errors.append(f"Apprise: {e}")
+                logger.warning("Apprise notification failed: %s", e)
 
-        except Exception as e:
-            error_msg = str(e)
+        # Send via QQ Bot (if configured)
+        if self.has_qqbot_configured():
+            qqbot_success = self.notify_event_qqbot_sync(job, event.event_type, analysis)
+            if not qqbot_success:
+                all_success = False
+                errors.append("QQ Bot notification failed")
+
+        # Update event status
+        if all_success or not self.config.notify.urls and not self.has_qqbot_configured():
+            self.db.mark_event_sent(event.id)
+            return True
+        else:
+            error_msg = "; ".join(errors) if errors else "Unknown error"
             self.db.mark_event_failed(event.id, error_msg)
-            logger.warning("Notification failed: %s", error_msg)
             return False
 
     def _analyze_job_output(self, job: Job) -> OutputAnalysis | None:
@@ -240,18 +370,41 @@ class Notifier:
         Returns:
             True if successful.
         """
-        if not self.config.notify.urls:
-            logger.warning("No notification URLs configured")
-            return False
+        success = True
 
-        try:
-            return self.apprise.notify(
-                title="🧪 Slurm Watchdog Test",
-                body=message,
-            )
-        except Exception as e:
-            logger.warning("Test notification failed: %s", e)
-            return False
+        # Test Apprise notifications
+        if self.config.notify.urls:
+            try:
+                apprise_success = self.apprise.notify(
+                    title="🧪 Slurm Watchdog Test",
+                    body=message,
+                )
+                if not apprise_success:
+                    success = False
+            except Exception as e:
+                logger.warning("Apprise test notification failed: %s", e)
+                success = False
+        else:
+            logger.warning("No Apprise notification URLs configured")
+
+        # Test QQ Bot notifications
+        if self.has_qqbot_configured():
+            try:
+                qqbot_success = self.notify_event_qqbot_sync(
+                    job=Job(
+                        job_id="test",
+                        user="test",
+                        state=JobState.COMPLETED,
+                    ),
+                    event_type=EventType.JOB_COMPLETED,
+                )
+                if not qqbot_success:
+                    success = False
+            except Exception as e:
+                logger.warning("QQ Bot test notification failed: %s", e)
+                success = False
+
+        return success
 
     def process_pending_events(self) -> tuple[int, int]:
         """Process all pending notification events.

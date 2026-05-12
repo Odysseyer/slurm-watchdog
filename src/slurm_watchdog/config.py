@@ -93,6 +93,30 @@ error_patterns = [
     "Abort",
     "Exception:",
 ]
+
+# QQ Bot configuration for notifications and interactive commands
+[qqbot]
+# Enable QQ Bot integration
+enabled = false
+
+# QQ Bot application credentials (from https://bot.q.qq.com)
+app_id = ""
+client_secret = ""
+
+# Webhook callback server configuration
+callback_host = "0.0.0.0"
+callback_port = 8080
+callback_path = "/qqbot/callback"
+
+# Notification targets (group/user openid lists)
+# Messages will be sent to these targets when job events occur
+notify_groups = []
+notify_users = []
+
+# Authorization for interactive commands
+# Empty lists mean all users/groups are authorized
+authorized_users = []
+authorized_groups = []
 """
 
 

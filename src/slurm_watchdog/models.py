@@ -128,6 +128,9 @@ class Job(BaseModel):
     # Output file path
     output_file: str | None = None
 
+    # Working directory (captured via scontrol while job is running)
+    work_dir: str | None = None
+
     def get_elapsed_seconds(self) -> int | None:
         """Parse elapsed time string to seconds."""
         if not self.elapsed_time:
@@ -239,12 +242,28 @@ class WatchdogConfig(BaseModel):
     user: str = ""  # Empty means current user
     job_name_filter: str | None = None
     partition_filter: str | None = None
+    min_runtime_seconds: int = 60  # Skip notifications for jobs shorter than this
 
 
 class DatabaseConfig(BaseModel):
     """Database configuration."""
 
     path: str = "~/.local/share/slurm-watchdog/watchdog.db"
+
+
+class QQBotConfig(BaseModel):
+    """QQ Bot configuration."""
+
+    enabled: bool = False
+    app_id: str = ""
+    client_secret: str = ""
+    callback_host: str = "0.0.0.0"
+    callback_port: int = 8080
+    callback_path: str = "/qqbot/callback"
+    notify_groups: list[str] = Field(default_factory=list)  # Group openid list
+    notify_users: list[str] = Field(default_factory=list)  # User openid list
+    authorized_users: list[str] = Field(default_factory=list)  # Empty = all users
+    authorized_groups: list[str] = Field(default_factory=list)  # Empty = all groups
 
 
 class Config(BaseModel):
@@ -254,6 +273,7 @@ class Config(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     output_analysis: OutputAnalysisConfig = Field(default_factory=OutputAnalysisConfig)
+    qqbot: QQBotConfig = Field(default_factory=QQBotConfig)
 
     def get_poll_interval(self, has_active_jobs: bool) -> int:
         """Get the appropriate poll interval based on job state."""

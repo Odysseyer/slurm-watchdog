@@ -318,6 +318,15 @@ def config_show(ctx: click.Context) -> None:
     click.echo(f"  enabled = {config.output_analysis.enabled}")
     click.echo(f"  tail_lines = {config.output_analysis.tail_lines}")
 
+    click.echo()
+    click.echo("[qqbot]")
+    click.echo(f"  enabled = {config.qqbot.enabled}")
+    if config.qqbot.enabled:
+        click.echo(f"  app_id = {config.qqbot.app_id[:8]}..." if config.qqbot.app_id else "  app_id = (not set)")
+        click.echo(f"  callback = {config.qqbot.callback_host}:{config.qqbot.callback_port}{config.qqbot.callback_path}")
+        click.echo(f"  notify_groups = {len(config.qqbot.notify_groups)}")
+        click.echo(f"  notify_users = {len(config.qqbot.notify_users)}")
+
 
 @config_cmd.command("init")
 @click.pass_context
@@ -407,6 +416,186 @@ def uninstall(ctx: click.Context) -> None:
         uninstall_service()
 
     click.echo("Service uninstalled.")
+
+
+# QQ Bot commands group
+@main.group()
+def qqbot() -> None:
+    """QQ Bot management commands."""
+    pass
+
+
+@qqbot.command()
+@click.pass_context
+def status_qqbot(ctx: click.Context) -> None:
+    """Show QQ Bot configuration status."""
+    config_path = _get_selected_config_path(ctx)
+    config = load_config(config_path, create_if_missing=True)
+
+    qqbot_config = config.qqbot
+
+    click.echo("QQ Bot Status")
+    click.echo("=" * 40)
+    click.echo(f"Enabled: {'Yes' if qqbot_config.enabled else 'No'}")
+
+    if qqbot_config.enabled:
+        click.echo(f"App ID: {qqbot_config.app_id[:8]}..." if qqbot_config.app_id else "App ID: Not configured")
+        click.echo(f"Callback: http://{qqbot_config.callback_host}:{qqbot_config.callback_port}{qqbot_config.callback_path}")
+        click.echo(f"Notify groups: {len(qqbot_config.notify_groups)}")
+        click.echo(f"Notify users: {len(qqbot_config.notify_users)}")
+        click.echo(f"Authorized users: {'All' if not qqbot_config.authorized_users else len(qqbot_config.authorized_users)}")
+        click.echo(f"Authorized groups: {'All' if not qqbot_config.authorized_groups else len(qqbot_config.authorized_groups)}")
+
+
+@qqbot.command()
+@click.pass_context
+def test_qqbot(ctx: click.Context) -> None:
+    """Test QQ Bot connection and send test message."""
+    import asyncio
+
+    config_path = _get_selected_config_path(ctx)
+    config = load_config(config_path, create_if_missing=True)
+
+    if not config.qqbot.enabled:
+        click.echo("QQ Bot is not enabled. Set [qqbot].enabled = true in config.")
+        sys.exit(1)
+
+    if not config.qqbot.app_id or not config.qqbot.client_secret:
+        click.echo("QQ Bot credentials not configured.")
+        click.echo("Set [qqbot].app_id and [qqbot].client_secret in config.")
+        sys.exit(1)
+
+    if not config.qqbot.notify_groups and not config.qqbot.notify_users:
+        click.echo("No notification targets configured.")
+        click.echo("Set [qqbot].notify_groups or [qqbot].notify_users in config.")
+        sys.exit(1)
+
+    async def do_test():
+        from slurm_watchdog.qqbot import QQBotClient, QQBotError
+
+        client = QQBotClient(
+            app_id=config.qqbot.app_id,
+            client_secret=config.qqbot.client_secret,
+        )
+        try:
+            # Test token refresh
+            token = await client.get_access_token()
+            click.echo(f"Token obtained: {token[:10]}...")
+
+            # Send test message
+            test_msg = "Test message from Slurm Watchdog"
+
+            for group_openid in config.qqbot.notify_groups:
+                try:
+                    await client.send_group_message(group_openid, test_msg)
+                    click.echo(f"Sent to group: {group_openid}")
+                except QQBotError as e:
+                    click.echo(f"Failed to send to group {group_openid}: {e}")
+
+            for user_openid in config.qqbot.notify_users:
+                try:
+                    await client.send_private_message(user_openid, test_msg)
+                    click.echo(f"Sent to user: {user_openid}")
+                except QQBotError as e:
+                    click.echo(f"Failed to send to user {user_openid}: {e}")
+
+            click.echo("QQ Bot test completed!")
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(do_test())
+    except Exception as e:
+        click.echo(f"QQ Bot test failed: {e}")
+        sys.exit(1)
+
+
+@qqbot.command()
+@click.option("--host", default=None, help="Override callback host")
+@click.option("--port", default=None, type=int, help="Override callback port")
+@click.pass_context
+def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
+    """Run QQ Bot webhook server (foreground)."""
+    import asyncio
+
+    config_path = _get_selected_config_path(ctx)
+    config = load_config(config_path, create_if_missing=True)
+
+    if not config.qqbot.enabled:
+        click.echo("QQ Bot is not enabled. Set [qqbot].enabled = true in config.")
+        sys.exit(1)
+
+    if not config.qqbot.app_id or not config.qqbot.client_secret:
+        click.echo("QQ Bot credentials not configured.")
+        sys.exit(1)
+
+    callback_host = host or config.qqbot.callback_host
+    callback_port = port or config.qqbot.callback_port
+
+    click.echo(f"Starting QQ Bot webhook server on {callback_host}:{callback_port}")
+    click.echo(f"Callback URL: http://{callback_host}:{callback_port}{config.qqbot.callback_path}")
+    click.echo("Press Ctrl+C to stop.")
+
+    async def run_server():
+        from slurm_watchdog.qqbot import QQBotClient, QQBotCommandProcessor, QQBotWebhookHandler
+        from slurm_watchdog.qqbot_server import WebhookServer
+
+        # Initialize components
+        client = QQBotClient(
+            app_id=config.qqbot.app_id,
+            client_secret=config.qqbot.client_secret,
+        )
+
+        with Database(config.database.path) as db:
+            processor = QQBotCommandProcessor(db=db, config=config, client=client)
+            handler = QQBotWebhookHandler(client, processor, config)
+
+            server = WebhookServer(
+                handler=handler,
+                host=callback_host,
+                port=callback_port,
+                path=config.qqbot.callback_path,
+            )
+
+            await server.start()
+
+            try:
+                # Keep running until interrupted
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await server.stop()
+                await client.close()
+
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        click.echo("\nQQ Bot server stopped.")
+
+
+# Register qqbot command group
+main.add_command(qqbot, name="qqbot")
+
+
+@main.command("hermes-scan")
+@click.pass_context
+def hermes_scan(ctx: click.Context) -> None:
+    """Run one scan cycle and output notifications to stdout.
+
+    Designed for Hermes cronjob integration: outputs formatted notification
+    text to stdout. Empty output means no notifications (cronjob stays silent).
+    Messages are delivered to WeChat via Hermes send_message.
+    """
+    config_path = _get_selected_config_path(ctx)
+    config = load_config(config_path, create_if_missing=True)
+
+    from slurm_watchdog.hermes_report import run_hermes_scan
+
+    output = run_hermes_scan(config)
+    if output:
+        click.echo(output)
 
 
 if __name__ == "__main__":

@@ -361,6 +361,30 @@ class JobWatcher:
             updated_at=datetime.now(),
         )
 
+    def _enrich_from_scontrol(self, job: Job) -> None:
+        """Enrich a running job with WorkDir and StdOut from scontrol.
+
+        Only called for NEW jobs to capture working directory info.
+
+        Args:
+            job: Job to enrich (modified in-place).
+        """
+        try:
+            scontrol_data = self.client.get_job_from_scontrol(job.job_id)
+            if scontrol_data:
+                job.work_dir = scontrol_data.get("WorkDir")
+                stdout = scontrol_data.get("StdOut")
+                if stdout and stdout != "StdOut":
+                    # Resolve %j placeholder in StdOut path
+                    stdout = stdout.replace("%j", job.job_id)
+                    stdout = stdout.replace("%x", job.name or "")
+                    job.output_file = stdout
+                elif job.work_dir:
+                    # Default: slurm-{job_id}.out in work_dir
+                    job.output_file = f"{job.work_dir}/slurm-{job.job_id}.out"
+        except SlurmError:
+            logger.debug("Could not enrich job %s via scontrol", job.job_id)
+
     def _scontrol_to_job(self, job_data: dict) -> Job:
         """Convert scontrol output to Job model."""
         user_id = job_data.get("UserId", "")
@@ -454,6 +478,7 @@ class JobWatcher:
                     new_events.extend(events)
             else:
                 # New job
+                self._enrich_from_scontrol(job)
                 self.db.upsert_job(job)
                 # Create start event for running jobs
                 if job.state == JobState.RUNNING:
@@ -506,8 +531,10 @@ class JobWatcher:
                             job = self._scontrol_to_job(scontrol_data)
                         else:
                             # Could not resolve terminal status from any source.
+                            # Try to determine state from output file analysis.
+                            resolved_state = self._resolve_state_from_output(old_job)
                             job = old_job.model_copy(update={
-                                "state": JobState.UNKNOWN,
+                                "state": resolved_state,
                                 "last_seen": now,
                                 "updated_at": now,
                             })
@@ -521,6 +548,39 @@ class JobWatcher:
                     updated_jobs.append(job)
 
         return updated_jobs, new_events
+
+    def _resolve_state_from_output(self, job: Job) -> JobState:
+        """Try to determine final state by analyzing the output file.
+
+        When sacct and scontrol are both unavailable, fall back to checking
+        the job's output file for error/convergence patterns.
+
+        Args:
+            job: Job that disappeared from the queue.
+
+        Returns:
+            Best-guess JobState (COMPLETED, FAILED, or UNKNOWN).
+        """
+        from slurm_watchdog.analyzer import OutputAnalyzer
+
+        output_path = job.output_file
+        if not output_path and job.work_dir:
+            output_path = f"{job.work_dir}/slurm-{job.job_id}.out"
+
+        if not output_path:
+            return JobState.UNKNOWN
+
+        try:
+            analyzer = OutputAnalyzer(self.config)
+            analysis = analyzer.analyze(output_path)
+            if analysis.has_errors:
+                return JobState.FAILED
+            if analysis.converged:
+                return JobState.COMPLETED
+        except Exception as exc:
+            logger.debug("Output analysis failed for job %s: %s", job.job_id, exc)
+
+        return JobState.UNKNOWN
 
     def _create_state_change_events(self, job: Job) -> list[Event]:
         """Create events for state changes.
